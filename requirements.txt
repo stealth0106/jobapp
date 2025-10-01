@@ -1,0 +1,5 @@
+playwright>=1.42,<1.43
+playwright-stealth>=1.0.6,<1.1
+gspread>=5.11,<6.0
+google-auth>=2.23,<3.0
+python-dotenv>=1.0,<1.1
