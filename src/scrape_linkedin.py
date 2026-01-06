@@ -198,6 +198,13 @@ def authorise_sheet(service_account_file: str, sheet_name: str) -> gspread.Works
     spreadsheet = client.open(sheet_name)
     return spreadsheet.sheet1
 
+def is_masked(value: str) -> bool:
+    """Check if a field value is masked by LinkedIn (contains ***)."""
+    if not value:
+        return False
+    return "***" in value
+
+
 def parse_applicants_count(raw: str) -> Optional[int]:
     if not raw:
         return None
@@ -415,6 +422,53 @@ async def enrich_job(context: BrowserContext, job: Dict[str, Any], conn: sqlite3
         await stealth_async(page)
         await page.goto(job["posting_url"], wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(5)
+
+        # Extract title from detail page if masked in search results
+        if is_masked(job.get("title", "")):
+            detail_title = await extract_text(
+                page,
+                [
+                    "h1.top-card-layout__title",
+                    "h1.topcard__title",
+                    "h1.job-details-jobs-unified-top-card__job-title",
+                    "h1",
+                ],
+            )
+            if detail_title and not is_masked(detail_title):
+                logging.info("Recovered masked title for job %s: %s", job["job_id"], detail_title[:50])
+                job["title"] = detail_title[:500]
+
+        # Extract company from detail page if masked
+        if is_masked(job.get("company", "")):
+            detail_company = await extract_text(
+                page,
+                [
+                    "a.topcard__org-name-link",
+                    "span.topcard__flavor--black-link",
+                    "a.top-card-layout__card-btn",
+                    "div.job-details-jobs-unified-top-card__company-name a",
+                    "div.job-details-jobs-unified-top-card__company-name",
+                ],
+            )
+            if detail_company and not is_masked(detail_company):
+                logging.info("Recovered masked company for job %s: %s", job["job_id"], detail_company[:50])
+                job["company"] = detail_company[:500]
+
+        # Extract location from detail page if masked
+        if is_masked(job.get("location", "")):
+            detail_location = await extract_text(
+                page,
+                [
+                    "span.topcard__flavor--bullet",
+                    "span.top-card-layout__bullet",
+                    "span.job-details-jobs-unified-top-card__bullet",
+                    "div.job-details-jobs-unified-top-card__primary-description-container span",
+                ],
+            )
+            if detail_location and not is_masked(detail_location):
+                logging.info("Recovered masked location for job %s: %s", job["job_id"], detail_location[:50])
+                job["location"] = detail_location[:500]
+
         description_el = await page.query_selector("section.description")
         if not description_el:
             description_el = await page.query_selector("div.show-more-less-html__markup")

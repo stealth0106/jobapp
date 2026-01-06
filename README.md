@@ -17,6 +17,7 @@ This project automates collecting new LinkedIn job postings and appending them t
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -e .
 playwright install chromium
 ```
 
@@ -46,6 +47,8 @@ If you set `LINKEDIN_SEARCH_URLS` (newline-separated list of job search URLs cop
 source .venv/bin/activate
 python -m src.scrape_linkedin
 ```
+
+Once the editable install step completes, the repository registers convenience entry points inside the virtualenv. With the environment activated you can call `appendjobs` from anywhere to push pending rows to Google Sheets.
 
 The script will:
 - Load cookies and open LinkedIn search results.
@@ -86,4 +89,3 @@ This runs hourly on weekdays during business hours. Adjust frequency conservativ
 - **LinkedIn prompts for login**: The cookies likely expired. Export fresh cookies and retry.
 - **`gspread` errors about permissions**: Share the sheet with the service account email displayed in the JSON credentials file.
 - **Cron runs but nothing is appended**: Inspect `logs/cron.log` to confirm the run had new jobs. If none, the scraper may have found duplicates already stored in SQLite.
-
