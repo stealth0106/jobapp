@@ -234,33 +234,89 @@ async def extract_text(page: Page, selectors: List[str]) -> str:
 
 
 async def scroll_results_to_end(page: Page, max_scroll_rounds: int) -> None:
+    # Try multiple selectors - LinkedIn changes their HTML frequently
     selector = "ul.jobs-search__results-list li"
-    last_count = len(await page.query_selector_all(selector))
+    cards = await page.query_selector_all(selector)
+    if len(cards) == 0:
+        selector = "li[data-occludable-job-id]"
+        cards = await page.query_selector_all(selector)
+    if len(cards) == 0:
+        selector = "li.jobs-search-results__list-item"
+        cards = await page.query_selector_all(selector)
+
+    last_count = len(cards)
+    logging.info("Using selector: %s (found %s cards initially)", selector, last_count)
     idle_rounds = 0
     scroll_round = 0
+
+    logging.info("Starting scroll with %s job cards visible", last_count)
+
     while True:
         scroll_round += 1
-        logging.debug("Scrolling results window (round %s)", scroll_round)
-        await page.mouse.wheel(0, 4000)
-        await asyncio.sleep(2 + min(scroll_round, 6) * 0.3)
+        logging.info("Scroll round %s: %s job cards currently loaded", scroll_round, last_count)
+
+        # Scroll the job results container specifically (not the main page)
+        scroll_result = await page.evaluate(
+            """
+() => {
+  // Find the scrollable job results container
+  const container = document.querySelector('.jobs-search-results-list')
+                 || document.querySelector('.jobs-search__results-list')
+                 || document.querySelector('div.scaffold-layout__list');
+
+  if (container) {
+    container.scrollTop = container.scrollHeight;
+    return {scrolled: true, container: 'found', scrollTop: container.scrollTop, scrollHeight: container.scrollHeight};
+  }
+
+  // Fallback to main page scroll
+  window.scrollTo(0, document.body.scrollHeight);
+  return {scrolled: true, container: 'fallback', scrollTop: window.scrollY, scrollHeight: document.body.scrollHeight};
+}
+            """
+        )
+        logging.debug("Scroll result: %s", scroll_result)
+
+        await asyncio.sleep(3 + min(scroll_round, 6) * 0.5)
+
         cards = await page.query_selector_all(selector)
         count = len(cards)
+
         if count > last_count:
+            logging.info("Found %s new cards (total now: %s)", count - last_count, count)
             last_count = count
             idle_rounds = 0
         else:
             idle_rounds += 1
+            logging.info("No new cards loaded (idle round %s/3)", idle_rounds)
+
+        # Check if the job results container is at the bottom
         at_bottom = await page.evaluate(
             """
 () => {
+  const container = document.querySelector('.jobs-search-results-list')
+                 || document.querySelector('.jobs-search__results-list')
+                 || document.querySelector('div.scaffold-layout__list');
+
+  if (container) {
+    return (container.scrollTop + container.clientHeight) >= (container.scrollHeight - 10);
+  }
+
+  // Fallback to main page
   const scroller = document.scrollingElement || document.body;
-  return (scroller.scrollTop + window.innerHeight) >= (scroller.scrollHeight - 5);
+  return (scroller.scrollTop + window.innerHeight) >= (scroller.scrollHeight - 10);
 }
             """
         )
-        if (at_bottom and idle_rounds >= 1) or idle_rounds >= 3:
+
+        if at_bottom:
+            logging.info("Reached bottom of results container")
+
+        if (at_bottom and idle_rounds >= 2) or idle_rounds >= 4:
+            logging.info("Stopping scroll: at_bottom=%s, idle_rounds=%s", at_bottom, idle_rounds)
             break
         if max_scroll_rounds and scroll_round >= max_scroll_rounds:
+            logging.info("Stopping scroll: reached max_scroll_rounds=%s", max_scroll_rounds)
             break
 
 
@@ -269,8 +325,12 @@ async def fetch_search_results(page: Page, query: str, location: str, max_scroll
     from urllib.parse import quote_plus
 
     targets: List[str] = []
+    # Check if URLs have manual pagination (start= parameter)
+    using_manual_pagination = False
     if search_urls:
         targets = search_urls
+        # Check if any URL has manual pagination parameter
+        using_manual_pagination = any('start=' in url for url in search_urls)
     else:
         encoded_query = quote_plus(query)
         encoded_location = quote_plus(location)
@@ -304,17 +364,37 @@ async def fetch_search_results(page: Page, query: str, location: str, max_scroll
             )
             await scroll_results_to_end(page, max_scroll_rounds)
 
+            # Try multiple selectors - LinkedIn changes their HTML
             cards = await page.query_selector_all("ul.jobs-search__results-list li")
-            logging.info("Found %s job cards on %s page %s", len(cards), url, page_number)
-            raw_jobs = await page.evaluate(
-                """
+            active_selector = "ul.jobs-search__results-list li"
+
+            if len(cards) == 0:
+                cards = await page.query_selector_all("li[data-occludable-job-id]")
+                active_selector = "li[data-occludable-job-id]"
+                logging.info("Fallback to selector: li[data-occludable-job-id]")
+
+            if len(cards) == 0:
+                cards = await page.query_selector_all("li.jobs-search-results__list-item")
+                active_selector = "li.jobs-search-results__list-item"
+                logging.info("Fallback to selector: li.jobs-search-results__list-item")
+
+            logging.info("Found %s job cards on page %s after scrolling (using %s)", len(cards), page_number, active_selector)
+
+            js_code = """
 () => {
-  const cards = Array.from(document.querySelectorAll('ul.jobs-search__results-list li'));
+  const cards = Array.from(document.querySelectorAll('""" + active_selector + """'));
   return cards.map((card) => {
-    const titleEl = card.querySelector('a.job-card-list__title') || card.querySelector('h3');
-    const companyEl = card.querySelector('h4');
-    const locationEl = card.querySelector('.job-search-card__location');
-    const linkEl = card.querySelector('a.job-card-list__title') || card.querySelector("a[href*='/jobs/view/']");
+    // Updated selectors based on LinkedIn's current HTML structure (2026)
+    const linkEl = card.querySelector('a.job-card-list__title--link') ||
+                   card.querySelector('a.disabled') ||
+                   card.querySelector('a.job-card-container__link') ||
+                   card.querySelector("a[href*='/jobs/view/']");
+    const titleEl = linkEl || card.querySelector('h3');
+    // Updated company and location selectors for new LinkedIn layout
+    const companyEl = card.querySelector('.artdeco-entity-lockup__subtitle') ||
+                      card.querySelector('h4');
+    const locationEl = card.querySelector('.artdeco-entity-lockup__caption') ||
+                       card.querySelector('.job-search-card__location');
     const rawHref = linkEl ? linkEl.getAttribute('href') : '';
     let href = rawHref || '';
     if (href.startsWith('/')) {
@@ -345,11 +425,16 @@ async def fetch_search_results(page: Page, query: str, location: str, max_scroll
     };
   });
 }
-                """
-            )
-            logging.info("Extracted %s candidate job entries from %s page %s", len(raw_jobs), url, page_number)
+            """
+            raw_jobs = await page.evaluate(js_code)
+            logging.info("Extracted %s candidate job entries from page %s", len(raw_jobs), page_number)
             if raw_jobs:
                 logging.debug("Sample raw job: %s", raw_jobs[0])
+
+            jobs_without_ids = 0
+            jobs_without_urls = 0
+            duplicates_in_page = 0
+
             for item in raw_jobs:
                 job_id = (item.get("job_id") or "").strip()
                 posting_url = (item.get("posting_url") or "").strip()
@@ -361,9 +446,14 @@ async def fetch_search_results(page: Page, query: str, location: str, max_scroll
                     key = posting_url
                 else:
                     key = job_id or posting_url
+                if not job_id:
+                    jobs_without_ids += 1
+                if not posting_url:
+                    jobs_without_urls += 1
                 if not key or not posting_url:
                     continue
                 if key in seen_keys:
+                    duplicates_in_page += 1
                     continue
                 seen_keys.add(key)
                 insights = item.get("insights") or []
@@ -384,15 +474,35 @@ async def fetch_search_results(page: Page, query: str, location: str, max_scroll
                     }
                 )
 
-            # attempt pagination
+            logging.info("Page %s stats - Cards: %s, Extracted: %s, No ID: %s, No URL: %s, Duplicates: %s, Added: %s",
+                        page_number, len(cards), len(raw_jobs), jobs_without_ids, jobs_without_urls,
+                        duplicates_in_page, len(raw_jobs) - jobs_without_urls - duplicates_in_page)
+
+            # attempt pagination (skip if using manual pagination parameters)
+            if using_manual_pagination:
+                logging.info("Skipping automatic pagination (manual pagination URLs with start= parameter)")
+                break
+
+            logging.info("Checking for Next button to paginate...")
             next_button = await page.query_selector("button[aria-label='Next']")
             if not next_button:
                 next_button = await page.query_selector("a[aria-label='Next']")
             if not next_button:
+                # Try alternative selectors
+                next_button = await page.query_selector("button[aria-label='View next page']")
+            if not next_button:
+                next_button = await page.query_selector("button.jobs-search-pagination__button--next")
+
+            if not next_button:
+                logging.info("No Next button found - this appears to be the last page")
                 break
+
             aria_disabled = await next_button.get_attribute("aria-disabled")
             disabled_attr = await next_button.get_attribute("disabled")
+            logging.info("Next button found: aria-disabled=%s, disabled=%s", aria_disabled, disabled_attr)
+
             if (aria_disabled and aria_disabled.lower() == "true") or disabled_attr is not None:
+                logging.info("Next button is disabled - no more pages available")
                 break
             page_number += 1
             logging.info("Moving to page %s for %s", page_number, url)
@@ -415,7 +525,7 @@ async def fetch_search_results(page: Page, query: str, location: str, max_scroll
 
 async def enrich_job(context: BrowserContext, job: Dict[str, Any], conn: sqlite3.Connection, pause_seconds: float) -> Optional[Dict[str, Any]]:
     if already_seen(conn, job["job_id"]):
-        logging.debug("Skipping already-seen job %s", job["job_id"])
+        logging.info("Skipping already-seen job %s (%s at %s)", job["job_id"], job.get("title", "")[:50], job.get("company", "")[:30])
         return None
     page = await context.new_page()
     try:
@@ -469,7 +579,12 @@ async def enrich_job(context: BrowserContext, job: Dict[str, Any], conn: sqlite3
                 logging.info("Recovered masked location for job %s: %s", job["job_id"], detail_location[:50])
                 job["location"] = detail_location[:500]
 
-        description_el = await page.query_selector("section.description")
+        # Updated description selectors for new LinkedIn layout
+        description_el = await page.query_selector(".jobs-description__content")
+        if not description_el:
+            description_el = await page.query_selector("div.jobs-box__html-content")
+        if not description_el:
+            description_el = await page.query_selector("section.description")
         if not description_el:
             description_el = await page.query_selector("div.show-more-less-html__markup")
         description = ""
@@ -619,6 +734,7 @@ async def run_scraper() -> None:
         await page.close()
 
         new_jobs: List[Dict[str, Any]] = []
+        skipped_count = 0
         with get_db_connection(settings["db_path"]) as conn:
             for job in jobs:
                 if not job.get("posting_url"):
@@ -626,6 +742,15 @@ async def run_scraper() -> None:
                 enriched = await enrich_job(context, job, conn, settings["job_pause_seconds"])
                 if enriched:
                     new_jobs.append(enriched)
+                else:
+                    skipped_count += 1
+
+        logging.info("=== SCRAPE SUMMARY ===")
+        logging.info("Total jobs found on LinkedIn: %s", len(jobs))
+        logging.info("Jobs skipped (already in database): %s", skipped_count)
+        logging.info("New jobs to append to sheet: %s", len(new_jobs))
+        logging.info("======================")
+
 
         await context.close()
         await browser.close()
