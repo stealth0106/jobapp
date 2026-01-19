@@ -17,7 +17,109 @@ from playwright_stealth import stealth_async
 import gspread
 from gspread.exceptions import APIError
 
+# Match score threshold for "Recommended" shortlist status
+SHORTLIST_THRESHOLD = 30
+
 SEARCH_URL = "https://www.linkedin.com/jobs/search/?keywords={query}&location={location}&f_TPR=r86400"
+
+
+# Profile-based matching criteria
+PROFILE_CRITERIA = {
+    "target_roles": [
+        "product manager", "product owner", "product lead", "product director",
+        "director of product", "head of product", "vp product", "vp of product",
+        "chief product", "cpo", "growth manager", "growth lead", "growth product",
+    ],
+    "exclude_keywords": [
+        "intern", "internship", "fresher", "entry level",
+        "associate product manager", "apm", "junior", "jr.", "trainee",
+    ],
+    "high_seniority": ["director", "head", "vp", "chief", "cpo", "avp"],
+    "mid_seniority": ["senior", "sr.", "lead", "principal", "staff"],
+    "strong_domains": [
+        "healthcare", "healthtech", "health tech", "medical", "telehealth",
+        "edtech", "ed-tech", "education", "learning",
+        "ecommerce", "e-commerce", "d2c", "dtc", "direct to consumer",
+    ],
+    "good_domains": ["consumer", "b2b saas", "saas", "marketplace", "retail", "fintech"],
+    "ai_keywords": ["ai product", "ml product", "genai", "generative ai", "llm", "machine learning"],
+    "growth_keywords": [
+        "growth", "plg", "product-led", "experimentation", "a/b test",
+        "conversion", "retention", "monetization", "pricing", "freemium",
+    ],
+}
+
+
+def calculate_match_score(job: Dict[str, Any]) -> Tuple[int, List[str]]:
+    """Calculate a relevance score for the job based on profile fit.
+
+    Returns (score, reasons) where score >= SHORTLIST_THRESHOLD means recommended.
+    """
+    title = (job.get("title") or "").lower()
+    description = (job.get("description") or "").lower()
+    company = (job.get("company") or "").lower()
+    combined = f"{title} {description} {company}"
+
+    score = 0
+    reasons = []
+
+    # Exclusion check
+    for exclude in PROFILE_CRITERIA["exclude_keywords"]:
+        if exclude in title:
+            return -100, [f"Excluded: '{exclude}' in title"]
+
+    # Must be a product role
+    is_product_role = any(role in title for role in PROFILE_CRITERIA["target_roles"])
+    if not is_product_role:
+        return -100, ["Not a product management role"]
+
+    # Seniority scoring
+    if any(s in title for s in PROFILE_CRITERIA["high_seniority"]):
+        score += 30
+        reasons.append("Director/Head level")
+    elif any(s in title for s in PROFILE_CRITERIA["mid_seniority"]):
+        score += 20
+        reasons.append("Senior level")
+    else:
+        score -= 10
+        reasons.append("Entry/mid level")
+
+    # Domain scoring
+    strong_matches = [d for d in PROFILE_CRITERIA["strong_domains"] if d in combined]
+    good_matches = [d for d in PROFILE_CRITERIA["good_domains"] if d in combined]
+
+    if strong_matches:
+        score += 25
+        reasons.append(f"Domain: {', '.join(strong_matches[:2])}")
+    elif good_matches:
+        score += 10
+        reasons.append(f"Domain: {', '.join(good_matches[:2])}")
+
+    # AI/ML scoring
+    ai_matches = [k for k in PROFILE_CRITERIA["ai_keywords"] if k in combined]
+    if ai_matches:
+        score += 20
+        reasons.append(f"AI/ML: {', '.join(ai_matches[:2])}")
+
+    # Growth scoring
+    growth_matches = [k for k in PROFILE_CRITERIA["growth_keywords"] if k in combined]
+    if growth_matches:
+        score += 15
+        reasons.append(f"Growth: {', '.join(growth_matches[:2])}")
+
+    return score, reasons
+
+
+def sort_jobs_by_match_score(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sort jobs by match score (highest first) and add score/shortlist fields."""
+    for job in jobs:
+        score, reasons = calculate_match_score(job)
+        job["match_score"] = score
+        job["match_reasons"] = reasons
+        job["shortlist"] = "Recommended" if score >= SHORTLIST_THRESHOLD else "Ignore"
+
+    # Sort by score descending
+    return sorted(jobs, key=lambda x: x.get("match_score", 0), reverse=True)
 
 
 def setup_logging() -> None:
@@ -98,6 +200,7 @@ def ensure_storage(db_path: str) -> None:
             ("applicants", "TEXT"),
             ("scraped_at", "INTEGER"),
             ("appended_at", "TEXT"),
+            ("work_type", "TEXT"),
         ]
         for name, col_type in migrations:
             if name not in columns:
@@ -120,8 +223,8 @@ def persist(conn: sqlite3.Connection, job: Dict[str, Any]) -> None:
     conn.execute(
         """
         INSERT OR REPLACE INTO jobs
-            (job_id, title, company, location, posting_url, description, posted_at, applicants, scraped_at, appended_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (job_id, title, company, location, posting_url, description, posted_at, applicants, scraped_at, appended_at, work_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job["job_id"],
@@ -134,6 +237,7 @@ def persist(conn: sqlite3.Connection, job: Dict[str, Any]) -> None:
             job.get("applicants"),
             int(time.time()),
             job.get("appended_at"),
+            job.get("work_type"),
         ),
     )
 
@@ -215,6 +319,59 @@ def parse_applicants_count(raw: str) -> Optional[int]:
         except ValueError:
             return None
     return None
+
+
+def clean_title(raw: str) -> str:
+    """Remove duplicate text and 'with verification' suffix."""
+    if not raw:
+        return ""
+    lines = raw.strip().split('\n')
+    title = lines[0].strip()
+    return re.sub(r'\s+with verification$', '', title, flags=re.I)
+
+
+def clean_posted_at(raw: str) -> str:
+    """Extract just the time ago text."""
+    if not raw:
+        return ""
+    return raw.strip().split('\n')[0].strip()
+
+
+def parse_location_field(raw: str) -> Dict[str, Any]:
+    """Parse contaminated location into components.
+
+    Returns dict with keys: location, posted_at, applicants, work_type
+    """
+    if not raw:
+        return {'location': '', 'posted_at': None, 'applicants': None, 'work_type': None}
+
+    lines = raw.split('\n')
+    main_line = lines[0].strip()
+
+    # Split by middle dot (·) first
+    parts = re.split(r'\s*·\s*', main_line)
+    location = parts[0].strip() if parts else ""
+    posted_at = None
+    applicants = None
+    work_type = None
+
+    # Extract work type from location: (Remote), (Hybrid), (On-site)
+    work_match = re.search(r'\s*\((Remote|Hybrid|On-site)\)\s*$', location, re.I)
+    if work_match:
+        work_type = work_match.group(1)
+        location = location[:work_match.start()].strip()
+
+    for part in parts[1:]:
+        part = part.strip()
+        if re.search(r'(\d+\s*(hour|day|week|month|minute)s?\s*ago|reposted)', part, re.I):
+            posted_at = part
+        elif re.search(r'applicant|people clicked|clicked apply', part, re.I):
+            match = re.search(r'(over\s+)?(\d+)', part, re.I)
+            if match:
+                prefix = "Over " if match.group(1) else ""
+                applicants = f"{prefix}{match.group(2)} applicants"
+
+    return {'location': location, 'posted_at': posted_at, 'applicants': applicants, 'work_type': work_type}
 
 
 async def extract_text(page: Page, selectors: List[str]) -> str:
@@ -380,54 +537,157 @@ async def fetch_search_results(page: Page, query: str, location: str, max_scroll
 
             logging.info("Found %s job cards on page %s after scrolling (using %s)", len(cards), page_number, active_selector)
 
-            js_code = """
+            # First extract basic info from all cards (without URLs)
+            js_code_basic = """
 () => {
   const cards = Array.from(document.querySelectorAll('""" + active_selector + """'));
-  return cards.map((card) => {
-    // Updated selectors based on LinkedIn's current HTML structure (2026)
-    const linkEl = card.querySelector('a.job-card-list__title--link') ||
-                   card.querySelector('a.disabled') ||
-                   card.querySelector('a.job-card-container__link') ||
-                   card.querySelector("a[href*='/jobs/view/']");
-    const titleEl = linkEl || card.querySelector('h3');
+  return cards.map((card, index) => {
+    const titleEl = card.querySelector('a.job-card-list__title--link') ||
+                    card.querySelector('h3') ||
+                    card.querySelector('a');
     // Updated company and location selectors for new LinkedIn layout
     const companyEl = card.querySelector('.artdeco-entity-lockup__subtitle') ||
                       card.querySelector('h4');
     const locationEl = card.querySelector('.artdeco-entity-lockup__caption') ||
                        card.querySelector('.job-search-card__location');
-    const rawHref = linkEl ? linkEl.getAttribute('href') : '';
-    let href = rawHref || '';
-    if (href.startsWith('/')) {
-      href = 'https://www.linkedin.com' + href;
-    }
-    if (href.includes('?')) {
-      href = href.split('?')[0];
-    }
     let jobId = card.getAttribute('data-occludable-job-id') || card.getAttribute('data-entity-urn') || '';
     if (jobId && jobId.includes(':')) {
       const parts = jobId.split(':');
       jobId = parts[parts.length - 1];
-    }
-    if (!jobId && href) {
-      const match = href.match(/\/jobs\/view\/(\d+)/);
-      if (match) {
-        jobId = match[1];
-      }
     }
     return {
       job_id: jobId,
       title: titleEl ? titleEl.innerText.trim() : '',
       company: companyEl ? companyEl.innerText.trim() : '',
       location: locationEl ? locationEl.innerText.trim() : '',
-      posting_url: href,
+      card_index: index,
       posted_label: (card.querySelector('time') ? card.querySelector('time').innerText.trim() : ''),
       insights: Array.from(card.querySelectorAll('.job-search-card__insight')).map(el => el.innerText.trim()),
     };
   });
 }
             """
-            raw_jobs = await page.evaluate(js_code)
-            logging.info("Extracted %s candidate job entries from page %s", len(raw_jobs), page_number)
+            raw_jobs = await page.evaluate(js_code_basic)
+            logging.info("Extracted basic info for %s candidate job entries from page %s", len(raw_jobs), page_number)
+
+            # Now capture job URLs - try multiple methods
+            logging.info("Capturing job URLs using job_id and click fallback...")
+            for job_data in raw_jobs:
+                card_index = job_data.get("card_index", 0)
+                job_id = job_data.get("job_id", "").strip()
+
+                # Method 1: If we have a job_id, construct the URL directly (fastest and most reliable)
+                if job_id and job_id.isdigit():
+                    posting_url = f"https://www.linkedin.com/jobs/view/{job_id}"
+                    job_data['posting_url'] = posting_url
+                    logging.debug("Card %s: Constructed URL from job_id: %s", card_index + 1, posting_url)
+                    continue
+
+                # Method 2: Try to extract href from the card's link element
+                try:
+                    card = cards[card_index]
+                    link_element = await card.query_selector('a[href*="/jobs/view/"]')
+
+                    if link_element:
+                        href = await link_element.get_attribute('href')
+                        if href and '/jobs/view/' in href:
+                            # Normalize the URL
+                            if href.startswith('/'):
+                                href = 'https://www.linkedin.com' + href
+                            posting_url = href.split('?')[0]
+                            job_data['posting_url'] = posting_url
+
+                            # Extract job_id if not present
+                            if not job_id:
+                                match = re.search(r'/jobs/view/(\d+)', posting_url)
+                                if match:
+                                    job_data['job_id'] = match.group(1)
+
+                            logging.debug("Card %s: Extracted URL from href: %s", card_index + 1, posting_url)
+                            continue
+
+                    # Method 3: Click the card and capture URL from page navigation or detail panel
+                    logging.debug("Card %s: No job_id or href found, trying click method...", card_index + 1)
+
+                    # Scroll the card into view first
+                    await card.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.3)
+
+                    # Try to find and click the link within the card (not the card itself)
+                    link_element = await card.query_selector('a.job-card-list__title--link, a.job-card-container__link, a')
+
+                    if link_element:
+                        # Click the link element specifically
+                        await link_element.click()
+                        await asyncio.sleep(2)  # Wait for URL to update and detail panel to load
+
+                        # Get the current page URL (LinkedIn updates it when you click a job)
+                        current_url = page.url
+
+                        # Extract job URL from the current page URL
+                        if '/jobs/view/' in current_url:
+                            # Clean the URL
+                            posting_url = current_url.split('?')[0]
+                            job_data['posting_url'] = posting_url
+
+                            # Extract job_id from URL if not already present
+                            if not job_data.get('job_id'):
+                                match = re.search(r'/jobs/view/(\d+)', posting_url)
+                                if match:
+                                    job_data['job_id'] = match.group(1)
+
+                            logging.debug("Card %s: Captured URL %s", card_index + 1, posting_url)
+                        else:
+                            # URL didn't update - try extracting from the detail panel
+                            logging.debug("Card %s: URL didn't update (current: %s), trying detail panel extraction", card_index + 1, current_url)
+
+                            # Try to get URL from the job detail panel's share button or apply button
+                            detail_panel_url = await page.evaluate("""
+                                () => {
+                                    // Try to find the job URL in the detail panel
+                                    const applyButton = document.querySelector('a[href*="/jobs/view/"]');
+                                    if (applyButton) {
+                                        const href = applyButton.getAttribute('href');
+                                        if (href && href.includes('/jobs/view/')) {
+                                            return href.startsWith('http') ? href : 'https://www.linkedin.com' + href;
+                                        }
+                                    }
+                                    // Try alternative: look in the detail panel container
+                                    const detailPanel = document.querySelector('.jobs-details, .job-details');
+                                    if (detailPanel) {
+                                        const link = detailPanel.querySelector('a[href*="/jobs/view/"]');
+                                        if (link) {
+                                            const href = link.getAttribute('href');
+                                            return href.startsWith('http') ? href : 'https://www.linkedin.com' + href;
+                                        }
+                                    }
+                                    return null;
+                                }
+                            """)
+
+                            if detail_panel_url:
+                                posting_url = detail_panel_url.split('?')[0]
+                                job_data['posting_url'] = posting_url
+
+                                if not job_data.get('job_id'):
+                                    match = re.search(r'/jobs/view/(\d+)', posting_url)
+                                    if match:
+                                        job_data['job_id'] = match.group(1)
+
+                                logging.debug("Card %s: Captured URL from detail panel %s", card_index + 1, posting_url)
+                            else:
+                                logging.warning("Card %s: Could not capture URL from URL or detail panel", card_index + 1)
+                                job_data['posting_url'] = ''
+                    else:
+                        logging.warning("Card %s: No clickable link found in card", card_index + 1)
+                        job_data['posting_url'] = ''
+
+                except Exception as e:
+                    logging.warning("Card %s: Failed to click and capture URL: %s", card_index + 1, e)
+                    job_data['posting_url'] = ''
+
+            logging.info("Captured URLs for %s/%s cards on page %s",
+                        sum(1 for j in raw_jobs if j.get('posting_url')), len(raw_jobs), page_number)
             if raw_jobs:
                 logging.debug("Sample raw job: %s", raw_jobs[0])
 
@@ -462,15 +722,24 @@ async def fetch_search_results(page: Page, query: str, location: str, max_scroll
                     if "applicant" in insight.lower():
                         applicants_hint = insight
                         break
+
+                # Clean extracted data
+                raw_title = item.get("title", "")
+                raw_location = item.get("location", "")
+
+                cleaned_title = clean_title(raw_title)
+                location_parsed = parse_location_field(raw_location)
+
                 jobs.append(
                     {
                         "job_id": job_id or key,
-                        "title": item.get("title", "")[:500],
+                        "title": cleaned_title[:500],
                         "company": item.get("company", "")[:500],
-                        "location": item.get("location", "")[:500],
+                        "location": location_parsed['location'][:500] if location_parsed['location'] else "",
                         "posting_url": posting_url,
-                        "posted_hint": item.get("posted_label", "")[:200],
-                        "applicants_hint": applicants_hint[:200],
+                        "posted_hint": location_parsed['posted_at'] or item.get("posted_label", "")[:200],
+                        "applicants_hint": location_parsed['applicants'] or applicants_hint[:200],
+                        "work_type": location_parsed['work_type'],
                     }
                 )
 
@@ -531,97 +800,135 @@ async def enrich_job(context: BrowserContext, job: Dict[str, Any], conn: sqlite3
     try:
         await stealth_async(page)
         await page.goto(job["posting_url"], wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)  # Wait longer for React to render
 
-        # Extract title from detail page if masked in search results
-        if is_masked(job.get("title", "")):
-            detail_title = await extract_text(
-                page,
-                [
-                    "h1.top-card-layout__title",
-                    "h1.topcard__title",
-                    "h1.job-details-jobs-unified-top-card__job-title",
-                    "h1",
-                ],
-            )
-            if detail_title and not is_masked(detail_title):
-                logging.info("Recovered masked title for job %s: %s", job["job_id"], detail_title[:50])
-                job["title"] = detail_title[:500]
+        # Use JS-based extraction for all fields (LinkedIn uses obfuscated class names)
+        js_code = """() => {
+            let title = '';
+            let company = '';
+            let location = '';
+            let workType = '';
+            let postedAt = '';
+            let applicants = '';
+            let description = '';
 
-        # Extract company from detail page if masked
-        if is_masked(job.get("company", "")):
-            detail_company = await extract_text(
-                page,
-                [
-                    "a.topcard__org-name-link",
-                    "span.topcard__flavor--black-link",
-                    "a.top-card-layout__card-btn",
-                    "div.job-details-jobs-unified-top-card__company-name a",
-                    "div.job-details-jobs-unified-top-card__company-name",
-                ],
-            )
-            if detail_company and not is_masked(detail_company):
-                logging.info("Recovered masked company for job %s: %s", job["job_id"], detail_company[:50])
-                job["company"] = detail_company[:500]
+            // Find company by link to /company/
+            const companyLinks = document.querySelectorAll('a[href*="/company/"]');
+            for (const link of companyLinks) {
+                const text = link.innerText.trim();
+                if (text && !text.includes('follower') && text.length < 100) {
+                    company = text;
+                    break;
+                }
+            }
 
-        # Extract location from detail page if masked
-        if is_masked(job.get("location", "")):
-            detail_location = await extract_text(
-                page,
-                [
-                    "span.topcard__flavor--bullet",
-                    "span.top-card-layout__bullet",
-                    "span.job-details-jobs-unified-top-card__bullet",
-                    "div.job-details-jobs-unified-top-card__primary-description-container span",
-                ],
-            )
-            if detail_location and not is_masked(detail_location):
-                logging.info("Recovered masked location for job %s: %s", job["job_id"], detail_location[:50])
-                job["location"] = detail_location[:500]
+            // Get title from page title
+            const pageTitle = document.title || '';
+            const titleMatch = pageTitle.match(/^([^|]+)/);
+            if (titleMatch) {
+                title = titleMatch[1].trim();
+            }
 
-        # Updated description selectors for new LinkedIn layout
-        description_el = await page.query_selector(".jobs-description__content")
-        if not description_el:
-            description_el = await page.query_selector("div.jobs-box__html-content")
-        if not description_el:
-            description_el = await page.query_selector("section.description")
-        if not description_el:
-            description_el = await page.query_selector("div.show-more-less-html__markup")
-        description = ""
-        if description_el:
-            description = (await description_el.inner_text()).strip()
-        posted_at = job.get("posted_hint", "")
-        detail_posted = await extract_text(
-            page,
-            [
-                "span.jobs-unified-top-card__posted-date",
-                "span.job-details-jobs-unified-top-card__posted-date",
-                "span.jobs-unified-top-card__bullet",
-            ],
-        )
-        if detail_posted:
-            posted_at = detail_posted
-        applicants_text = job.get("applicants_hint", "")
-        detail_applicants = await extract_text(
-            page,
-            [
-                "span.jobs-unified-top-card__applicant-count",
-                "span.jobs-unified-top-card__subtitle-secondary-grouping li:nth-of-type(2)",
-                "span.jobs-unified-top-card__bullet",
-            ],
-        )
-        if detail_applicants:
-            applicants_text = detail_applicants
+            // Find location and metadata from the body text
+            const bodyText = document.body.innerText || '';
+
+            // Look for pattern: "Location · X time ago · Y applicants"
+            const metaMatch = bodyText.match(/([A-Za-z][A-Za-z ,]+(?:India|Area)?)\\s*[·•]\\s*(\\d+\\s*(?:hours?|days?|weeks?|months?|minutes?)\\s*ago)/i);
+            if (metaMatch) {
+                location = metaMatch[1].trim();
+                postedAt = metaMatch[2].trim();
+            }
+
+            // Look for work type
+            if (bodyText.includes('On-site')) workType = 'On-site';
+            else if (bodyText.includes('Hybrid')) workType = 'Hybrid';
+            else if (bodyText.includes('Remote')) workType = 'Remote';
+
+            // Look for applicants
+            const appMatch = bodyText.match(/(\\d+)\\s*applicants?/i);
+            if (appMatch) {
+                applicants = appMatch[1] + ' applicants';
+            }
+
+            // Extract job description - find content between "About the job" and next section
+            const descMatch = bodyText.match(/About the job([\\s\\S]*?)(?:Show less|Set alert for similar jobs|About the company|Similar jobs)/i);
+            if (descMatch) {
+                description = descMatch[1].trim();
+            }
+
+            return {title, company, location, workType, postedAt, applicants, description};
+        }"""
+        extracted = await page.evaluate(js_code)
+
+        # Use JS-extracted values, falling back to search results data
+        js_title = extracted.get('title', '')
+        js_company = extracted.get('company', '')
+        js_location = extracted.get('location', '')
+        js_work_type = extracted.get('workType', '')
+        js_posted_at = extracted.get('postedAt', '')
+        js_applicants = extracted.get('applicants', '')
+        description = extracted.get('description', '')
+
+        # Update job with JS-extracted data if current data is empty/masked
+        if (is_masked(job.get("title", "")) or not job.get("title", "").strip()) and js_title and not is_masked(js_title):
+            logging.info("Recovered title for job %s: %s", job["job_id"], js_title[:50])
+            job["title"] = js_title[:500]
+
+        if (is_masked(job.get("company", "")) or not job.get("company", "").strip()) and js_company and not is_masked(js_company):
+            logging.info("Recovered company for job %s: %s", job["job_id"], js_company[:50])
+            job["company"] = js_company[:500]
+
+        if (is_masked(job.get("location", "")) or not job.get("location", "").strip()) and js_location and not is_masked(js_location):
+            logging.info("Recovered location for job %s: %s", job["job_id"], js_location[:50])
+            job["location"] = js_location[:500]
+
+        # Set work_type if not already set
+        if not job.get("work_type") and js_work_type:
+            job["work_type"] = js_work_type
+
+        # Use JS-extracted posted_at and applicants
+        posted_at = js_posted_at or job.get("posted_hint", "")
+        applicants_text = js_applicants or job.get("applicants_hint", "")
+
+        # Fallback to old selectors if JS extraction failed for description
+        if not description:
+            description_el = await page.query_selector(".jobs-description__content")
+            if not description_el:
+                description_el = await page.query_selector("div.jobs-box__html-content")
+            if not description_el:
+                description_el = await page.query_selector("section.description")
+            if not description_el:
+                description_el = await page.query_selector("div.show-more-less-html__markup")
+            if description_el:
+                description = (await description_el.inner_text()).strip()
+
+        # Parse applicants count from JS-extracted text
         applicants_count = parse_applicants_count(applicants_text)
         applicants_value: Optional[str] = None
         if applicants_count is not None:
             applicants_value = str(applicants_count)
         elif applicants_text:
             applicants_value = applicants_text
+
+        # Apply cleaning functions to extracted data
+        job["title"] = clean_title(job.get("title", ""))
         job["description"] = description
-        job["posted_at"] = posted_at or None
+        job["posted_at"] = clean_posted_at(posted_at) or None
         job["applicants"] = applicants_value
         job["applicants_source"] = applicants_text or None
+
+        # Parse location if it looks contaminated (contains middle dots or extra metadata)
+        current_location = job.get("location", "")
+        if current_location and ('·' in current_location or 'ago' in current_location.lower()):
+            loc_parsed = parse_location_field(current_location)
+            job["location"] = loc_parsed['location']
+            if not job.get("work_type") and loc_parsed['work_type']:
+                job["work_type"] = loc_parsed['work_type']
+            if not job.get("posted_at") and loc_parsed['posted_at']:
+                job["posted_at"] = clean_posted_at(loc_parsed['posted_at'])
+            if not applicants_value and loc_parsed['applicants']:
+                job["applicants"] = loc_parsed['applicants']
+
         logging.info("Job %s posted label=%s applicants_label=%s parsed=%s", job["job_id"], posted_at, applicants_text, applicants_value)
         persist(conn, job)
         conn.commit()
@@ -636,11 +943,24 @@ async def enrich_job(context: BrowserContext, job: Dict[str, Any], conn: sqlite3
 
 
 def prepare_sheet_rows(jobs: List[Dict[str, Any]]) -> Tuple[List[List[str]], List[Tuple[str, str]]]:
+    """Prepare job data for Google Sheets, including match score and shortlist status.
+
+    Jobs should be pre-sorted by match score using sort_jobs_by_match_score().
+    Columns: job_id, title, company, location, posting_url, posted_at, applicants,
+             description, appended_at, match_score, shortlist, work_type
+    """
     rows: List[List[str]] = []
     updates: List[Tuple[str, str]] = []
     for job in jobs:
         appended_at = datetime.utcnow().isoformat()
         applicants_value = job.get("applicants") or ""
+
+        # Ensure match score is calculated if not already present
+        if "match_score" not in job:
+            score, reasons = calculate_match_score(job)
+            job["match_score"] = score
+            job["shortlist"] = "Recommended" if score >= SHORTLIST_THRESHOLD else "Ignore"
+
         rows.append([
             job.get("job_id", ""),
             job.get("title", ""),
@@ -651,6 +971,9 @@ def prepare_sheet_rows(jobs: List[Dict[str, Any]]) -> Tuple[List[List[str]], Lis
             applicants_value,
             job.get("description", ""),
             appended_at,
+            str(job.get("match_score", 0)),
+            job.get("shortlist", "Ignore"),
+            job.get("work_type", ""),
         ])
         job["appended_at"] = appended_at
         updates.append((appended_at, job.get("job_id", "")))
@@ -756,8 +1079,13 @@ async def run_scraper() -> None:
         await browser.close()
 
     if new_jobs:
-        rows, updates = prepare_sheet_rows(new_jobs)
-        logging.info("Appending %s new jobs to Google Sheets", len(rows))
+        # Sort jobs by match score (highest first) before appending
+        sorted_jobs = sort_jobs_by_match_score(new_jobs)
+        recommended_count = sum(1 for j in sorted_jobs if j.get("shortlist") == "Recommended")
+        logging.info("Match scoring complete: %s recommended, %s to ignore", recommended_count, len(sorted_jobs) - recommended_count)
+
+        rows, updates = prepare_sheet_rows(sorted_jobs)
+        logging.info("Appending %s new jobs to Google Sheets (sorted by match score)", len(rows))
         append_to_sheet(rows, worksheet)
         mark_jobs_appended(settings["db_path"], updates)
     else:

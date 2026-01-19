@@ -13,6 +13,7 @@ from .scrape_linkedin import (
     mark_jobs_appended,
     prepare_sheet_rows,
     setup_logging,
+    sort_jobs_by_match_score,
 )
 
 BATCH_SIZE = 25
@@ -26,7 +27,7 @@ def chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, A
 def fetch_pending_jobs(db_path: str) -> List[Dict[str, Any]]:
     with get_db_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT job_id, title, company, location, posting_url, description, posted_at, applicants, scraped_at "
+            "SELECT job_id, title, company, location, posting_url, description, posted_at, applicants, scraped_at, work_type "
             "FROM jobs WHERE appended_at IS NULL ORDER BY scraped_at"
         ).fetchall()
         return [dict(row) for row in rows]
@@ -44,10 +45,15 @@ def append_pending_jobs() -> None:
 
     logging.info("Preparing to append %s pending jobs", len(pending_jobs))
 
+    # Sort all pending jobs by match score before batching
+    sorted_jobs = sort_jobs_by_match_score(pending_jobs)
+    recommended_count = sum(1 for j in sorted_jobs if j.get("shortlist") == "Recommended")
+    logging.info("Match scoring: %s recommended, %s to ignore", recommended_count, len(sorted_jobs) - recommended_count)
+
     worksheet = authorise_sheet(settings["service_account_file"], settings["spreadsheet_name"])
 
     appended = 0
-    for batch in chunked(pending_jobs, BATCH_SIZE):
+    for batch in chunked(sorted_jobs, BATCH_SIZE):
         rows, updates = prepare_sheet_rows(batch)
         try:
             append_to_sheet(rows, worksheet)
@@ -56,7 +62,7 @@ def append_pending_jobs() -> None:
             break
         mark_jobs_appended(settings["db_path"], updates)
         appended += len(rows)
-        logging.info("Appended %s/%s pending jobs", appended, len(pending_jobs))
+        logging.info("Appended %s/%s pending jobs", appended, len(sorted_jobs))
     else:
         logging.info("Successfully appended all pending jobs")
 
